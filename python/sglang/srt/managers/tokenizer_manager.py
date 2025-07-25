@@ -304,6 +304,13 @@ class TokenizerManager:
         # For load balancing
         self.current_load = 0
         self.current_load_lock = asyncio.Lock()
+        
+        # For PD role transition
+        self.current_role = (
+            "prefill" if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else "decode" if self.disaggregation_mode == DisaggregationMode.DECODE
+            else "unified"
+        )
 
         # Metrics
         if self.enable_metrics:
@@ -920,6 +927,40 @@ class TokenizerManager:
         async with self._cond:
             self._updating = False
             self._cond.notify_all()
+
+    async def wait_for_requests_completion(self, timeout: float = 30.0):
+        """等待当前所有请求完成"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if len(self.rid_to_state) == 0:
+                break
+            await asyncio.sleep(0.1)
+        logger.info(f"等待请求完成，剩余请求数: {len(self.rid_to_state)}")
+
+    async def cleanup_role_resources(self, role: str):
+        """清理指定角色的资源"""
+        logger.info(f"清理 {role} 角色资源")
+        # 这里可以添加具体的资源清理逻辑
+        # 例如：清理KV缓存、停止相关服务等
+        await asyncio.sleep(0.1)  # 占位
+
+    async def init_role_resources(self, role: str):
+        """初始化指定角色的资源"""
+        logger.info(f"初始化 {role} 角色资源")
+        # 这里可以添加具体的资源初始化逻辑
+        # 例如：设置KV缓存、启动相关服务等
+        await asyncio.sleep(0.1)  # 占位
+
+    def resume_generation(self):
+        """恢复请求处理（同步版本的continue_generation）"""
+        # 为了与http_server的同步调用兼容
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 如果在async上下文中，直接创建task
+            asyncio.create_task(self.continue_generation())
+        else:
+            # 如果不在async上下文中，运行协程
+            loop.run_until_complete(self.continue_generation())
 
     async def update_weights_from_disk(
         self,

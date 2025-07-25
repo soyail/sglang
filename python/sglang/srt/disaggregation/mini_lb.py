@@ -6,9 +6,11 @@ import asyncio
 import dataclasses
 import logging
 import random
+import threading
+import time
 import urllib
 from itertools import chain
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import aiohttp
 import orjson
@@ -48,18 +50,270 @@ class PrefillConfig:
     bootstrap_port: Optional[int] = None
 
 
+@dataclasses.dataclass
+class NodeConfig:
+    """统一的节点配置，支持动态角色转换"""
+    url: str
+    current_role: str  # "prefill" or "decode"
+    bootstrap_port: Optional[int] = None
+    last_load: float = 0.0
+    last_update_time: float = 0.0
+    is_transitioning: bool = False
+
+
+@dataclasses.dataclass
+class LoadMetrics:
+    """节点负载指标"""
+    cpu_usage: float = 0.0
+    memory_usage: float = 0.0
+    request_queue_size: int = 0
+    throughput: float = 0.0
+    avg_latency: float = 0.0
+
+
 class MiniLoadBalancer:
     def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
+        
+        # 新增：统一节点管理
+        self.nodes: Dict[str, NodeConfig] = {}
+        self._init_nodes()
+        
+        # 负载监控配置
+        self.load_check_interval = 300.0  # 300秒检查一次负载
+        self.load_imbalance_threshold = 0.7  # 负载不均衡阈值
+        self.monitoring_enabled = True
+        self.monitoring_thread = None
+        
+        # 启动负载监控线程
+        self._start_load_monitoring()
+
+    def _init_nodes(self):
+        """初始化节点配置"""
+        for config in self.prefill_configs:
+            self.nodes[config.url] = NodeConfig(
+                url=config.url,
+                current_role="prefill",
+                bootstrap_port=config.bootstrap_port
+            )
+        
+        for server in self.decode_servers:
+            self.nodes[server] = NodeConfig(
+                url=server,
+                current_role="decode"
+            )
+
+    def _start_load_monitoring(self):
+        """启动负载监控线程"""
+        if self.monitoring_thread is None:
+            self.monitoring_enabled = True
+            self.monitoring_thread = threading.Thread(
+                target=self._load_monitoring_loop,
+                daemon=True
+            )
+            self.monitoring_thread.start()
+            logger.info("负载监控线程已启动")
+
+    def _stop_load_monitoring(self):
+        """停止负载监控线程"""
+        self.monitoring_enabled = False
+        if self.monitoring_thread:
+            self.monitoring_thread.join(timeout=5.0)
+            self.monitoring_thread = None
+            logger.info("负载监控线程已停止")
+
+    def _load_monitoring_loop(self):
+        """负载监控主循环"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            while self.monitoring_enabled:
+                try:
+                    loop.run_until_complete(self._check_and_balance_load())
+                except Exception as e:
+                    logger.error(f"负载监控出错: {e}")
+                
+                # 等待下一次检查
+                for _ in range(int(self.load_check_interval)):
+                    if not self.monitoring_enabled:
+                        break
+                    time.sleep(1.0)
+        finally:
+            loop.close()
+
+    async def _check_and_balance_load(self):
+        """检查负载并执行负载均衡"""
+        try:
+            # 收集所有节点的负载信息
+            load_metrics = await self._collect_load_metrics()
+            
+            # 分析负载是否均衡
+            imbalance_info = self._analyze_load_imbalance(load_metrics)
+            
+            if imbalance_info:
+                logger.info(f"检测到负载不均衡: {imbalance_info}")
+                # 执行角色转换
+                await self._execute_role_transitions(imbalance_info)
+                
+        except Exception as e:
+            logger.error(f"负载检查失败: {e}")
+
+    async def _collect_load_metrics(self) -> Dict[str, LoadMetrics]:
+        """收集所有节点的负载指标"""
+        load_metrics = {}
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            tasks = []
+            for node_url in self.nodes.keys():
+                tasks.append(self._get_node_load(session, node_url))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for node_url, result in zip(self.nodes.keys(), results):
+                if isinstance(result, Exception):
+                    logger.warning(f"获取节点 {node_url} 负载失败: {result}")
+                    # 使用默认负载指标
+                    load_metrics[node_url] = LoadMetrics()
+                else:
+                    load_metrics[node_url] = result
+                    
+        return load_metrics
+
+    async def _get_node_load(self, session: aiohttp.ClientSession, node_url: str) -> LoadMetrics:
+        """获取单个节点的负载"""
+        try:
+            async with session.get(f"{node_url}/get_load") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return LoadMetrics(
+                        cpu_usage=data.get("cpu_usage", 0.0),
+                        memory_usage=data.get("memory_usage", 0.0),
+                        request_queue_size=data.get("queue_size", 0),
+                        throughput=data.get("throughput", 0.0),
+                        avg_latency=data.get("avg_latency", 0.0)
+                    )
+        except Exception as e:
+            logger.warning(f"获取节点 {node_url} 负载指标失败: {e}")
+        
+        return LoadMetrics()
+
+    def _analyze_load_imbalance(self, load_metrics: Dict[str, LoadMetrics]) -> Optional[Dict]:
+        """分析负载是否不均衡"""
+        prefill_nodes = [url for url, node in self.nodes.items() if node.current_role == "prefill"]
+        decode_nodes = [url for url, node in self.nodes.items() if node.current_role == "decode"]
+        
+        if not prefill_nodes or not decode_nodes:
+            return None
+            
+        # 计算平均负载
+        prefill_avg_load = sum(load_metrics[url].cpu_usage for url in prefill_nodes) / len(prefill_nodes)
+        decode_avg_load = sum(load_metrics[url].cpu_usage for url in decode_nodes) / len(decode_nodes)
+        
+        # 检查是否存在负载不均衡
+        load_diff = abs(prefill_avg_load - decode_avg_load)
+        
+        if load_diff > self.load_imbalance_threshold:
+            # 确定转换方向
+            if prefill_avg_load > decode_avg_load:
+                # prefill负载高，需要将一些prefill节点转为decode
+                heavy_role = "prefill"
+                light_role = "decode"
+                heavy_nodes = prefill_nodes
+                light_nodes = decode_nodes
+            else:
+                # decode负载高，需要将一些decode节点转为prefill
+                heavy_role = "decode" 
+                light_role = "prefill"
+                heavy_nodes = decode_nodes
+                light_nodes = prefill_nodes
+                
+            # 选择负载最高的节点进行转换
+            heavy_node_loads = [(url, load_metrics[url].cpu_usage) for url in heavy_nodes]
+            heavy_node_loads.sort(key=lambda x: x[1], reverse=True)
+            
+            return {
+                "heavy_role": heavy_role,
+                "light_role": light_role,
+                "candidate_node": heavy_node_loads[0][0],
+                "load_diff": load_diff,
+                "heavy_avg_load": prefill_avg_load if heavy_role == "prefill" else decode_avg_load,
+                "light_avg_load": decode_avg_load if heavy_role == "prefill" else prefill_avg_load
+            }
+            
+        return None
+
+    async def _execute_role_transitions(self, imbalance_info: Dict):
+        """执行角色转换"""
+        candidate_node = imbalance_info["candidate_node"]
+        target_role = imbalance_info["light_role"]
+        
+        logger.info(f"开始将节点 {candidate_node} 从 {imbalance_info['heavy_role']} 转换为 {target_role}")
+        
+        try:
+            # 调用节点的角色转换API
+            success = await self._switch_node_role(candidate_node, target_role)
+            
+            if success:
+                # 更新本地节点配置
+                self.nodes[candidate_node].current_role = target_role
+                self.nodes[candidate_node].is_transitioning = False
+                
+                # 更新服务器列表
+                self._update_server_lists()
+                
+                logger.info(f"节点 {candidate_node} 成功转换为 {target_role}")
+            else:
+                logger.error(f"节点 {candidate_node} 角色转换失败")
+                
+        except Exception as e:
+            logger.error(f"执行节点 {candidate_node} 角色转换时出错: {e}")
+
+    async def _switch_node_role(self, node_url: str, target_role: str) -> bool:
+        """调用节点的角色转换API"""
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                payload = {"target_role": target_role}
+                async with session.post(f"{node_url}/switch_role", json=payload) as response:
+                    return response.status == 200
+        except Exception as e:
+            logger.error(f"调用节点 {node_url} 角色转换API失败: {e}")
+            return False
+
+    def _update_server_lists(self):
+        """根据当前节点角色更新服务器列表"""
+        self.prefill_servers = []
+        self.prefill_configs = []
+        self.decode_servers = []
+        
+        for url, node in self.nodes.items():
+            if node.current_role == "prefill":
+                self.prefill_servers.append(url)
+                self.prefill_configs.append(PrefillConfig(url, node.bootstrap_port))
+            elif node.current_role == "decode":
+                self.decode_servers.append(url)
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
         self.prefill_servers.append(new_prefill_config.url)
+        
+        # 添加到统一节点管理
+        self.nodes[new_prefill_config.url] = NodeConfig(
+            url=new_prefill_config.url,
+            current_role="prefill",
+            bootstrap_port=new_prefill_config.bootstrap_port
+        )
 
     def add_decode_server(self, new_decode_server: str):
         self.decode_servers.append(new_decode_server)
+        
+        # 添加到统一节点管理
+        self.nodes[new_decode_server] = NodeConfig(
+            url=new_decode_server,
+            current_role="decode"
+        )
 
     def select_pair(self):
         # TODO: return some message instead of panic
@@ -351,9 +605,11 @@ def _generate_bootstrap_room():
 
 # We may utilize `GenerateReqInput`'s logic later
 def _get_request_batch_size(request):
-    if (text := request.get("text")) is not None:
+    text = request.get("text")
+    if text is not None:
         return None if isinstance(text, str) else len(text)
-    if (input_ids := request.get("input_ids")) is not None:
+    input_ids = request.get("input_ids")
+    if input_ids is not None:
         return None if isinstance(input_ids[0], int) else len(input_ids)
     return None
 
@@ -398,6 +654,98 @@ async def register(obj: PDRegistryRequest):
     )
 
     return Response(status_code=200)
+
+
+@app.get("/deployment_status")
+async def get_deployment_status():
+    """获取当前部署状态"""
+    if not load_balancer:
+        raise HTTPException(status_code=500, detail="Load balancer not initialized")
+    
+    status = {
+        "nodes": {},
+        "prefill_count": len(load_balancer.prefill_servers),
+        "decode_count": len(load_balancer.decode_servers),
+        "monitoring_enabled": load_balancer.monitoring_enabled
+    }
+    
+    for url, node in load_balancer.nodes.items():
+        status["nodes"][url] = {
+            "current_role": node.current_role,
+            "bootstrap_port": node.bootstrap_port,
+            "last_load": node.last_load,
+            "last_update_time": node.last_update_time,
+            "is_transitioning": node.is_transitioning
+        }
+    
+    return ORJSONResponse(content=status)
+
+
+@app.post("/switch_node_role")
+async def switch_node_role(request_data: dict):
+    """手动切换节点角色"""
+    if not load_balancer:
+        raise HTTPException(status_code=500, detail="Load balancer not initialized")
+    
+    node_url = request_data.get("node_url")
+    target_role = request_data.get("target_role")
+    
+    if not node_url or not target_role:
+        raise HTTPException(status_code=400, detail="Missing node_url or target_role")
+    
+    if target_role not in ["prefill", "decode"]:
+        raise HTTPException(status_code=400, detail="Invalid target_role. Must be 'prefill' or 'decode'")
+    
+    if node_url not in load_balancer.nodes:
+        raise HTTPException(status_code=404, detail=f"Node {node_url} not found")
+    
+    current_role = load_balancer.nodes[node_url].current_role
+    if current_role == target_role:
+        return ORJSONResponse(content={"message": f"Node {node_url} is already {target_role}"})
+    
+    try:
+        # 标记节点正在转换
+        load_balancer.nodes[node_url].is_transitioning = True
+        
+        # 执行角色转换
+        success = await load_balancer._switch_node_role(node_url, target_role)
+        
+        if success:
+            # 更新节点配置
+            load_balancer.nodes[node_url].current_role = target_role
+            load_balancer.nodes[node_url].is_transitioning = False
+            load_balancer._update_server_lists()
+            
+            return ORJSONResponse(content={
+                "message": f"Successfully switched node {node_url} from {current_role} to {target_role}"
+            })
+        else:
+            load_balancer.nodes[node_url].is_transitioning = False
+            raise HTTPException(status_code=500, detail=f"Failed to switch node {node_url} role")
+            
+    except Exception as e:
+        load_balancer.nodes[node_url].is_transitioning = False
+        raise HTTPException(status_code=500, detail=f"Error switching node role: {str(e)}")
+
+
+@app.post("/toggle_monitoring")
+async def toggle_monitoring(request_data: dict):
+    """启用/禁用负载监控"""
+    if not load_balancer:
+        raise HTTPException(status_code=500, detail="Load balancer not initialized")
+    
+    enable = request_data.get("enable", True)
+    
+    if enable and not load_balancer.monitoring_enabled:
+        load_balancer._start_load_monitoring()
+        message = "Load monitoring enabled"
+    elif not enable and load_balancer.monitoring_enabled:
+        load_balancer._stop_load_monitoring()
+        message = "Load monitoring disabled"
+    else:
+        message = f"Load monitoring already {'enabled' if enable else 'disabled'}"
+    
+    return ORJSONResponse(content={"message": message, "monitoring_enabled": load_balancer.monitoring_enabled})
 
 
 def run(prefill_configs, decode_addrs, host, port):

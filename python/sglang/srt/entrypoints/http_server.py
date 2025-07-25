@@ -659,6 +659,96 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     return Response(status_code=200)
 
 
+@app.post("/switch_role")
+async def switch_role(request: Request):
+    """切换节点角色(prefill/decode)"""
+    try:
+        body = await request.json()
+        target_role = body.get("target_role")
+        
+        if not target_role:
+            return ORJSONResponse(
+                content={"error": "Missing target_role parameter"},
+                status_code=HTTPStatus.BAD_REQUEST
+            )
+        
+        if target_role not in ["prefill", "decode"]:
+            return ORJSONResponse(
+                content={"error": "Invalid target_role. Must be 'prefill' or 'decode'"},
+                status_code=HTTPStatus.BAD_REQUEST
+            )
+        
+        # 检查当前角色
+        current_role = getattr(_global_state.tokenizer_manager, 'current_role', 'unknown')
+        
+        if current_role == target_role:
+            return ORJSONResponse(
+                content={"message": f"Node is already in {target_role} role"},
+                status_code=HTTPStatus.OK
+            )
+        
+        # 执行角色切换
+        logger.info(f"开始切换节点角色: {current_role} -> {target_role}")
+        
+        # 1. 停止接受新请求
+        _global_state.tokenizer_manager.pause_generation()
+        
+        # 2. 等待当前请求完成
+        await _global_state.tokenizer_manager.wait_for_requests_completion()
+        
+        # 3. 清理当前角色相关资源
+        await _global_state.tokenizer_manager.cleanup_role_resources(current_role)
+        
+        # 4. 初始化新角色
+        await _global_state.tokenizer_manager.init_role_resources(target_role)
+        
+        # 5. 更新角色标识
+        _global_state.tokenizer_manager.current_role = target_role
+        
+        # 6. 恢复接受请求
+        _global_state.tokenizer_manager.resume_generation()
+        
+        logger.info(f"节点角色切换完成: {current_role} -> {target_role}")
+        
+        return ORJSONResponse(
+            content={
+                "message": f"Successfully switched from {current_role} to {target_role}",
+                "previous_role": current_role,
+                "current_role": target_role
+            },
+            status_code=HTTPStatus.OK
+        )
+        
+    except Exception as e:
+        logger.error(f"角色切换失败: {e}")
+        return ORJSONResponse(
+            content={"error": f"Role switch failed: {str(e)}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+@app.get("/get_role")
+async def get_role():
+    """获取当前节点角色"""
+    try:
+        current_role = getattr(_global_state.tokenizer_manager, 'current_role', 'unknown')
+        load_info = await _global_state.tokenizer_manager.get_load()
+        
+        return ORJSONResponse(
+            content={
+                "current_role": current_role,
+                "load_info": load_info,
+                "timestamp": time.time()
+            },
+            status_code=HTTPStatus.OK
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            content={"error": f"Failed to get role info: {str(e)}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
 @app.post("/abort_request")
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
